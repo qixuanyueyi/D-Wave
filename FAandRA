@@ -1,0 +1,151 @@
+from itertools import product
+import numpy as np
+import matplotlib.pyplot as plt
+from pyqubo import Array, Constraint, Placeholder
+from dwave.system import DWaveSampler, EmbeddingComposite
+from dimod import BinaryQuadraticModel, SimulatedAnnealingSampler as DWaveSimulatedAnnealingSampler, Vartype
+from dimod import SampleSet
+from multiprocessing import Pool
+import random
+
+# --- 参数设置 ---
+N_VALUES = [3, 4]  # 护士人数
+D_VALUES = range(5, 15)  # 天数
+LAM = 0.3  # 约束系数
+GAMMA = 1.3  # 约束系数
+A = 7 / 2  # 连续工作超过 2 天的罚款
+NUM_READS = 100  # 采样次数
+NUM_SIMULATIONS = 2  # 每个 (N, D) 组合的模拟次数
+
+# --- D-Wave 设置 ---
+SAMPLER_CONFIG = {'solver': 'Advantage_system4.1', 'token': 'DEV-6b339387b1ea9bb1db76c01cb14eede9054b05ab'}  # 替换为你的 token
+D_WAVE_SAMPLER = EmbeddingComposite(DWaveSampler(**SAMPLER_CONFIG))
+
+# ---  Reverse Annealing Schedule ---
+ANNEAL_SCHEDULE = [
+    (0.0, 1.0),
+    (2.0, 0.6),
+    (12.0, 0.6),
+    (14.0, 1.0)
+]
+
+# ---  辅助函数 ---
+def build_hamiltonian(N, D): 
+
+    q = Array.create('q', shape=(max(N_VALUES), max(D_VALUES)), vartype='BINARY')  # Define q here
+    
+    J = np.zeros((N, D, N, D))
+    for n1, d1, n2, d2 in product(range(N), range(D), range(N), range(D)):
+        if n1 == n2 and d1 + 1 == d2:
+            J[n1, d1, n2, d2] = A
+
+    H1 = sum(J[n1, d1, n2, d2] * q[n1, d1] * q[n2, d2]
+             for n1, d1, n2, d2 in product(range(N), range(D), range(N), range(D)))
+    H2 = sum((sum(q[n, d] for n in range(N)) - 1) ** 2 for d in range(D))
+    H3 = sum((sum(q[n, d] for d in range(D)) - 1) ** 2 for n in range(N))
+
+    H = Placeholder('alpha') * Constraint(H1, 'H1') + Placeholder('lam') * Constraint(
+        H2, 'H2') + Placeholder('gamma') * H3
+    return H.compile()
+
+# 定义函数计算基态概率
+def calc_probability(sampleset: SampleSet, num_reads: int, threshold=1e-9):
+    ground_state_energy = min(sampleset.record.energy)
+    count = sum(1 for sample in sampleset.record if abs(sample.energy - ground_state_energy) < threshold)
+    return count / num_reads * 100
+
+def run_simulation(params):
+    """执行单个 (N, D) 组合的模拟。"""
+    N, D = params
+    print(f"Running simulation for N={N}, D={D}")
+
+    model = build_hamiltonian(N, D)  # Pass q to build_hamiltonian
+    feed_dict = {'alpha': 1.0, 'lam': LAM, 'gamma': GAMMA}
+    bqm = model.to_bqm(feed_dict=feed_dict)
+
+    # --- 执行 Forward Annealing (FA) ---
+    fa_probabilities = []
+    for _ in range(NUM_SIMULATIONS):
+        sampleset_fa = D_WAVE_SAMPLER.sample(bqm, num_reads=NUM_READS)
+        fa_probabilities.append(calc_probability(sampleset_fa,NUM_READS))
+
+    # --- 执行 Reverse Annealing (RA) ---
+    ra_probabilities = []
+    for _ in range(NUM_SIMULATIONS):
+        # 从 FA 的 sampleset 中随机选择一个解作为初始状态
+        fa_solutions = list(sampleset_fa.samples())
+        initial_state = random.choice(fa_solutions)
+        
+        # 使用D-Wave的reverse_anneal_params参数进行反向退火
+        reverse_anneal_params = dict(anneal_schedule=ANNEAL_SCHEDULE,
+                             initial_state=initial_state,
+                             reinitialize_state=True)
+        sampleset_ra = D_WAVE_SAMPLER.sample(bqm, num_reads=NUM_READS, **reverse_anneal_params)
+        
+        # 计算反向退火的基态概率
+        ra_probabilities.append(calc_probability(sampleset_ra,NUM_READS))
+
+    return N, D, fa_probabilities, ra_probabilities
+
+def compute_statistics(probabilities):
+    means = {}
+    std_devs = {}
+    for N in N_VALUES:
+        means[N] = [np.mean(probabilities[N][D]) for D in D_VALUES]
+        # 计算每次模拟的基态概率的标准差
+        std_devs[N] = [np.std(probabilities[N][D]) for D in D_VALUES]
+    return means, std_devs
+
+# --- 主程序 --- 
+if __name__ == "__main__":
+    # 存储结果
+    fa_probabilities = {N: {D: [] for D in D_VALUES} for N in N_VALUES}
+    ra_probabilities = {N: {D: [] for D in D_VALUES} for N in N_VALUES}
+
+    # 创建参数组合列表
+    param_combinations = list(product(N_VALUES, D_VALUES))
+
+    # 创建进程池
+    with Pool(processes=8) as pool:  # 使用 8 个进程
+        results = pool.map(run_simulation, param_combinations)
+
+    # 处理结果
+    for N, D, fa_probs, ra_probs in results:
+        fa_probabilities[N][D] = fa_probs
+        ra_probabilities[N][D] = ra_probs
+    
+    # 计算均值和标准差
+    fa_means, fa_stds = compute_statistics(fa_probabilities)
+    ra_means, ra_stds = compute_statistics(ra_probabilities)
+
+    # 绘制结果
+    fig, axs = plt.subplots(1, 2, figsize=(12, 5))
+
+    for i, solver_name in enumerate(['FA', 'RA']):
+        for N in N_VALUES:
+            if solver_name == 'FA':
+                axs[i].errorbar(D_VALUES, fa_means[N], yerr=fa_stds[N], fmt='o', label=f'N={N}', capsize=5)
+            else:
+                axs[i].errorbar(D_VALUES, ra_means[N], yerr=ra_stds[N], fmt='o', label=f'N={N}', capsize=5)
+
+        axs[i].set_xlabel('Days (D)')
+        axs[i].set_ylabel('Ground State Probability (%)')
+        axs[i].set_title(f'Ground State Probability vs Days (D-Wave {solver_name})')
+        axs[i].legend()
+        axs[i].grid(True)
+        axs[i].set_ylim(0, 100)
+
+    plt.xticks(D_VALUES)  # 设置 x 轴刻度为 D_values
+    plt.tight_layout()
+    plt.show()
+
+    # 绘制 RA 退火时间表
+    plt.figure()
+    plt.plot([0, 2, 12, 14], [1.0, 0.6, 0.6, 1.0], 'o-')
+    plt.xlabel('Time [us]')
+    plt.ylabel('Annealing Parameters')
+    plt.title('Anneal Schedule')
+    plt.xticks([0, 2, 12, 14])
+    plt.yticks([0.0, 0.2, 0.4, 0.6, 0.8, 1.0])
+    plt.grid(True)
+    plt.show()
